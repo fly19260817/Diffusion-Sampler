@@ -1,0 +1,22 @@
+# Target: Windows 10 x86_64; E:/anaconda3
+# RTX 4090 24GB, NVIDIA Windows driver 610.74. Not installed or tested.
+name: diffusion-sampler-windows
+channels:
+  - conda-forge
+  - nodefaults
+dependencies:
+  - python=3.11
+  - pip>=25
+  - git
+  - pip:
+      - --extra-index-url https://download.pytorch.org/whl/cu126
+      - torch==2.9.1+cu126
+      - torchvision==0.24.1+cu126
+      - diffusers @ git+https://github.com/huggingface/diffusers.git@aaf57d03a3edfbd9de457d2872417a92f149a91d
+      - transformers==5.20.2
+      - accelerate>=1.10,<2
+      - safetensors>=0.6
+      - sentencepiece>=0.2
+      - protobuf>=4.25
+      - Pillow>=11
+      - scipy>=1.14
