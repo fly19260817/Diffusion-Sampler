@@ -151,7 +151,7 @@ FlowScheduler 沿用官方静态/动态 shift、mu、Karras/exponential/beta 网
 独立 solver 目前仅桥接 FlowMatchEulerDiscreteScheduler / FlowScheduler；
 不会把 DDPM/VP 或 Heun 的重复时间网格静默当作 rectified flow。
 
-自定义 solver 实现 `SolverProtocol.reset()` 与
+SolverProtocol 是普通接口基类，可选择继承；不做运行时协议检查。自定义 solver 实现 `reset()` 与
 `step(model_output, sample, sigma, sigma_next)` 即可，每步一次模型评估。
 AB2 使用变步长系数，第一步用 Euler 启动，每次 set_timesteps 重置历史。
 接口不支持需要额外模型评估的 Heun/RK 求解器。自定义 solver 模式下不支持

@@ -1,21 +1,17 @@
 """Model-aware loading, component composition, and unified sampling."""
-from __future__ import annotations
-
+import inspect
 import json
-from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Mapping
 
 import diffusers
 import torch
 from huggingface_hub import hf_hub_download
-from huggingface_hub.errors import EntryNotFoundError
+from huggingface_hub.errors import EntryNotFoundError, LocalEntryNotFoundError
 
 from .scheduler import FlowScheduler
 from .solver import PredictionType, Solver, SolverProtocol
 
 
-@dataclass(frozen=True)
 class ComponentSource:
     """Load one component with its actual Diffusers/Transformers class.
 
@@ -23,18 +19,19 @@ class ComponentSource:
     local_files_only, etc. Tokenizers must be paired with compatible encoders.
     """
 
-    component_class: type
-    model_id: str | Path
-    kwargs: Mapping[str, Any] = field(default_factory=dict)
+    def __init__(self, component_class, model_id, kwargs=None):
+        self.component_class = component_class
+        self.model_id = model_id
+        self.kwargs = dict(kwargs or {})
 
     def load(self):
-        return self.component_class.from_pretrained(str(self.model_id), **dict(self.kwargs))
+        return self.component_class.from_pretrained(str(self.model_id), **self.kwargs)
 
 
-@dataclass
 class SamplingResult:
-    images: Any
-    raw: Any
+    def __init__(self, images, raw):
+        self.images = images
+        self.raw = raw
 
 
 # Concrete classes are resolved lazily so SD3/FLUX1/Qwen also work without FLUX3.
@@ -52,15 +49,18 @@ _ALIASES = {
 
 
 def _resolve_family(family: str) -> str:
-    name = _ALIASES.get(family.lower(), family.lower())
-    if name not in _FAMILIES:
-        raise ValueError(f"Unknown model family {family!r}; choose {list(_FAMILIES)}")
-    return name
+    name = family.lower()
+    return _ALIASES.get(name, name)
 
 
-def _detect_family(model_id: str, load_kwargs: Mapping[str, Any]) -> str:
+def _load_model_index(model_id, load_kwargs):
+    """Prefer the modular index, falling back only when that file is absent."""
     directory = Path(model_id)
-    config = None
+    hub_options = {}
+    for key in ("revision", "cache_dir", "token", "local_files_only"):
+        if key in load_kwargs:
+            hub_options[key] = load_kwargs[key]
+
     for filename in ("modular_model_index.json", "model_index.json"):
         if directory.is_dir():
             candidate = directory / filename
@@ -70,29 +70,79 @@ def _detect_family(model_id: str, load_kwargs: Mapping[str, Any]) -> str:
             try:
                 candidate = Path(hf_hub_download(
                     repo_id=model_id, filename=filename,
-                    **{key: load_kwargs[key] for key in (
-                        "revision", "cache_dir", "token", "local_files_only",
-                    ) if key in load_kwargs},
+                    **hub_options,
                 ))
-            except EntryNotFoundError:
+            except EntryNotFoundError as error:
+                if isinstance(error, LocalEntryNotFoundError) and not hub_options.get("local_files_only"):
+                    raise
+                # Classic repositories do not have a modular index.
+                # Authentication, network and malformed-config errors propagate.
                 continue
-        config = json.loads(candidate.read_text(encoding="utf-8"))
-        break
-    if config is None:
-        raise ValueError("No model index found; supply a Diffusers model directory/repository")
-    name = str(config.get("_class_name", ""))
+        return json.loads(candidate.read_text(encoding="utf-8"))
+    raise FileNotFoundError(f"No Diffusers model index found in {model_id}")
+
+
+def _detect_family(model_id, load_kwargs):
+    config = _load_model_index(model_id, load_kwargs)
+    name = config["_class_name"]
     if name.startswith("Flux3"):
         return "flux3"
     supported = {
         "StableDiffusion3Pipeline": "sd35", "FluxPipeline": "flux1",
         "QwenImagePipeline": "qwen-image",
     }
-    if name not in supported:
-        raise ValueError(
-            f"Cannot infer a supported text-to-image family from {name!r}; "
-            "pass family explicitly or use from_backend()"
-        )
     return supported[name]
+
+
+def _load_components(components):
+    loaded = {}
+    for name, component in components.items():
+        if isinstance(component, ComponentSource):
+            component = component.load()
+        loaded[name] = component
+    return loaded
+
+
+def _check_component_names(components, accepted_names):
+    # Diffusers may silently ignore unknown names, so check at this boundary.
+    unknown = set(components) - set(accepted_names)
+    if unknown:
+        raise ValueError(f"Unknown components: {sorted(unknown)}")
+
+
+def _load_classic_pipeline(backend_class, model_id, components, dtype, load_kwargs):
+    accepted = inspect.signature(backend_class.__init__).parameters
+    _check_component_names(components, accepted)
+    loaded = _load_components(components)
+    options = dict(load_kwargs)
+    if dtype is not None:
+        options["torch_dtype"] = dtype
+    return backend_class.from_pretrained(model_id, **loaded, **options)
+
+
+def _load_modular_pipeline(
+    backend_class, model_id, components, dtype, load_kwargs, component_load_kwargs,
+):
+    backend = backend_class.from_pretrained(model_id, **load_kwargs)
+    _check_component_names(components, backend.components)
+    loaded = _load_components(components)
+    backend.update_components(**loaded)
+
+    remaining = []
+    for name in backend.pretrained_component_names:
+        # Explicit None disables an encoder; do not reload it.
+        if name not in loaded and getattr(backend, name) is None:
+            remaining.append(name)
+
+    options = {}
+    for key in ("cache_dir", "token", "local_files_only"):
+        if key in load_kwargs:
+            options[key] = load_kwargs[key]
+    options.update(component_load_kwargs or {})
+    if dtype is not None and "dtype" not in options:
+        options["dtype"] = {"vae": torch.float32, "default": dtype}
+    backend.load_components(names=remaining, **options)
+    return backend
 
 
 class SamplingPipeline:
@@ -110,10 +160,10 @@ class SamplingPipeline:
     @classmethod
     def from_pretrained(
         cls, model_id: str | Path, *, family: str = "auto",
-        components: Mapping[str, Any] | None = None,
+        components: dict | None = None,
         scheduler=None, solver: SolverProtocol | None = None,
         torch_dtype: torch.dtype | None = None,
-        component_load_kwargs: Mapping[str, Any] | None = None,
+        component_load_kwargs: dict | None = None,
         **load_kwargs,
     ):
         """Components can be loaded objects, ComponentSource objects, or None.
@@ -122,59 +172,26 @@ class SamplingPipeline:
         embeddings). Omitted components come from the model repository.
         """
         model_id = str(model_id)
-        family = _detect_family(model_id, load_kwargs) if family == "auto" else _resolve_family(family)
+        if family == "auto":
+            family = _detect_family(model_id, load_kwargs)
+        else:
+            family = _resolve_family(family)
         class_name, modular = _FAMILIES[family]
-        backend_class = getattr(diffusers, class_name, None)
-        if backend_class is None:
-            raise ImportError(f"{class_name} is missing; install a Diffusers build supporting {family}")
-        if family == "flux3" and not hasattr(diffusers, "Flux3AutoBlocks"):
-            raise ImportError("FLUX.3 requires the source Diffusers dependency in environments/")
+        backend_class = getattr(diffusers, class_name)
         supplied = dict(components or {})
         if "scheduler" in supplied:
             raise ValueError("Pass scheduler through the dedicated scheduler= argument")
-        duplicated = set(supplied) & set(load_kwargs)
-        if duplicated:
-            raise ValueError(f"Components supplied twice: {sorted(duplicated)}")
         if not modular and component_load_kwargs:
             raise ValueError("component_load_kwargs is for modular pipelines; use ComponentSource for others")
         if modular:
-            backend = backend_class.from_pretrained(model_id, **load_kwargs)
-            unknown = set(supplied) - set(backend.components)
-            if unknown:
-                raise ValueError(f"Unknown components: {sorted(unknown)}")
-            loaded = {
-                name: value.load() if isinstance(value, ComponentSource) else value
-                for name, value in supplied.items()
-            }
-            if loaded:
-                backend.update_components(**loaded)
-            # Exclude explicit None entries: load_components() would otherwise reload them.
-            remaining = [
-                name for name in backend.pretrained_component_names
-                if name not in loaded and getattr(backend, name, None) is None
-            ]
-            options = {
-                key: load_kwargs[key] for key in ("cache_dir", "token", "local_files_only")
-                if key in load_kwargs
-            }
-            options.update(dict(component_load_kwargs or {}))
-            if torch_dtype is not None and "dtype" not in options:
-                options["dtype"] = {"vae": torch.float32, "default": torch_dtype}
-            backend.load_components(names=remaining, **options)
+            backend = _load_modular_pipeline(
+                backend_class, model_id, supplied, torch_dtype,
+                load_kwargs, component_load_kwargs,
+            )
         else:
-            import inspect
-            accepted = set(inspect.signature(backend_class.__init__).parameters)
-            unknown = set(supplied) - accepted
-            if unknown:
-                raise ValueError(f"Unknown components: {sorted(unknown)}")
-            loaded = {
-                name: value.load() if isinstance(value, ComponentSource) else value
-                for name, value in supplied.items()
-            }
-            options = dict(load_kwargs)
-            if torch_dtype is not None:
-                options["torch_dtype"] = torch_dtype
-            backend = backend_class.from_pretrained(model_id, **loaded, **options)
+            backend = _load_classic_pipeline(
+                backend_class, model_id, supplied, torch_dtype, load_kwargs,
+            )
         result = cls(backend, modular=modular)
         result.configure_sampling(scheduler=scheduler, solver=solver)
         return result
@@ -183,20 +200,12 @@ class SamplingPipeline:
     def from_components(cls, *, family: str, scheduler, blocks=None, **components):
         """Build entirely from supplied components; FLUX.3 accepts custom blocks."""
         class_name, modular = _FAMILIES[_resolve_family(family)]
-        loaded = {
-            name: value.load() if isinstance(value, ComponentSource) else value
-            for name, value in components.items()
-        }
+        loaded = _load_components(components)
         if modular:
             if blocks is None:
-                blocks_class = getattr(diffusers, "Flux3AutoBlocks", None)
-                if blocks_class is None:
-                    raise ImportError("Install the FLUX.3-capable Diffusers source dependency")
-                blocks = blocks_class()
+                blocks = diffusers.Flux3AutoBlocks()
             backend = blocks.init_pipeline()
-            unknown = set(loaded) - set(backend.components)
-            if unknown:
-                raise ValueError(f"Unknown components: {sorted(unknown)}")
+            _check_component_names(loaded, backend.components)
             backend.update_components(scheduler=scheduler, **loaded)
         else:
             if blocks is not None:
@@ -206,7 +215,7 @@ class SamplingPipeline:
 
     @classmethod
     def from_backend(cls, backend, *, solver: SolverProtocol | None = None):
-        modular = isinstance(backend, diffusers.ModularPipeline) if hasattr(diffusers, "ModularPipeline") else False
+        modular = isinstance(backend, diffusers.ModularPipeline)
         result = cls(backend, modular=modular)
         result.configure_sampling(solver=solver)
         return result
@@ -221,15 +230,10 @@ class SamplingPipeline:
 
     def replace_components(self, **components):
         """Replace components before configuring device placement/offloading."""
-        unknown = set(components) - set(self.components)
-        if unknown:
-            raise ValueError(f"Unknown components: {sorted(unknown)}")
+        _check_component_names(components, self.components)
         if "scheduler" in components:
             raise ValueError("Use configure_sampling() for scheduler changes")
-        loaded = {
-            name: value.load() if isinstance(value, ComponentSource) else value
-            for name, value in components.items()
-        }
+        loaded = _load_components(components)
         if self.modular:
             self.backend.update_components(**loaded)
         else:
@@ -301,5 +305,8 @@ class SamplingPipeline:
             raw = self.backend(output=output, **kwargs)
             return SamplingResult(images=raw, raw=raw)
         raw = self.backend(**kwargs)
-        images = raw.images if hasattr(raw, "images") else raw[0]
+        if isinstance(raw, tuple):
+            images = raw[0]
+        else:
+            images = raw.images
         return SamplingResult(images=images, raw=raw)

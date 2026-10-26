@@ -1,8 +1,5 @@
 """Numerical integration for the rectified-flow path x(s)=(1-s)x0+s*eps."""
-from __future__ import annotations
-
 from enum import Enum
-from typing import Protocol, runtime_checkable
 
 import torch
 
@@ -14,19 +11,20 @@ class PredictionType(str, Enum):
     V = "v_prediction"  # (1-sigma)*eps - sigma*x0, NOT a VP noise path
 
 
-@runtime_checkable
-class SolverProtocol(Protocol):
-    """One model evaluation per step; reset is called for each new schedule."""
+class SolverProtocol:
+    """Optional base class for solvers; implementing these two methods is enough."""
 
-    def reset(self) -> None: ...
+    def reset(self) -> None:
+        raise NotImplementedError
 
     def step(
         self, model_output: torch.Tensor, sample: torch.Tensor,
         sigma: float, sigma_next: float,
-    ) -> torch.Tensor: ...
+    ) -> torch.Tensor:
+        raise NotImplementedError
 
 
-class Solver:
+class Solver(SolverProtocol):
     """Euler or variable-step AB2, with an explicit model-output parameterization.
 
     All parameterizations describe the SAME linear rectified-flow path.
@@ -54,16 +52,15 @@ class Solver:
     ) -> torch.Tensor:
         if model_output.shape != sample.shape:
             raise ValueError("model_output and sample must have identical shapes")
-        if model_output.device != sample.device:
-            raise ValueError("model_output and sample must be on the same device")
         if not 0.0 <= sigma <= 1.0:
             raise ValueError("Rectified-flow sigma must be finite and in [0, 1]")
         # Accumulate in float32, preserving float64 for numerical research.
         dtype = torch.float64 if sample.dtype == torch.float64 else torch.float32
-        x, prediction = sample.to(dtype), model_output.to(dtype)
-        alpha = 1.0 - sigma
+        prediction = model_output.to(dtype)
         if self.prediction_type == PredictionType.FLOW:
             return prediction
+        x = sample.to(dtype)
+        alpha = 1.0 - sigma
         if self.prediction_type == PredictionType.EPSILON:
             if alpha == 0.0:
                 raise ValueError("epsilon prediction is singular at sigma=1; start below 1")
@@ -80,7 +77,8 @@ class Solver:
         self, model_output: torch.Tensor, sample: torch.Tensor,
         sigma: float, sigma_next: float,
     ) -> torch.Tensor:
-        sigma, sigma_next = float(sigma), float(sigma_next)
+        sigma = float(sigma)
+        sigma_next = float(sigma_next)
         if not 0.0 <= sigma_next < sigma <= 1.0:
             raise ValueError("Require 0 <= sigma_next < sigma <= 1")
         if not sample.is_floating_point() or not model_output.is_floating_point():
@@ -88,17 +86,18 @@ class Solver:
         if self._expected_sigma is not None and sigma != self._expected_sigma:
             raise ValueError("Discontinuous trajectory; call reset() before a new sample")
         derivative = self.to_derivative(model_output, sample, sigma)
-        h = sigma_next - sigma
+        step_size = sigma_next - sigma
         update = derivative
         if self.method == "ab2" and self._previous_derivative is not None:
             previous = self._previous_derivative
-            if previous.shape != derivative.shape or previous.device != derivative.device:
-                raise ValueError("Sample shape/device changed; reset the solver")
-            ratio = h / (2.0 * self._previous_step)
+            if previous.shape != derivative.shape:
+                raise ValueError("Sample shape changed; reset the solver")
+            # AB2 integrates the line through the current and previous derivatives.
+            ratio = step_size / (2.0 * self._previous_step)
             update = (1.0 + ratio) * derivative - ratio * previous
-        result = (sample.to(derivative.dtype) + h * update).to(sample.dtype)
+        result = (sample.to(derivative.dtype) + step_size * update).to(sample.dtype)
         if self.method == "ab2":
             self._previous_derivative = derivative.detach().clone()
-        self._previous_step = h
+        self._previous_step = step_size
         self._expected_sigma = sigma_next
         return result

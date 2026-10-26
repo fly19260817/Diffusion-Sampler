@@ -1,11 +1,11 @@
 # Target: WSL2 Ubuntu 22.04 x86_64; /home/user/miniconda3
 # RTX 4090 24GB, NVIDIA Windows driver 610.74. Not installed or tested.
-name: diffusion-sampler-wsl
+name: diffusion-sampler
 channels:
   - conda-forge
   - nodefaults
 dependencies:
-  - python=3.11
+  - python=3.12
   - pip>=25
   - git
   - pip:

@@ -29,10 +29,14 @@ def main():
         parser.error(f"Output already exists: {args.output}")
     if args.cpu_offload and args.device != "cuda":
         parser.error("--cpu-offload uses --device cuda")
+    solver = None
+    if args.solver != "default":
+        solver = Solver(args.solver)
+
     pipe = SamplingPipeline.from_pretrained(
         args.model, family=args.family, torch_dtype=getattr(torch, args.dtype),
         local_files_only=args.local_files_only,
-        solver=None if args.solver == "default" else Solver(args.solver),
+        solver=solver,
     )
     if args.cpu_offload:
         pipe.enable_cpu_offload()
@@ -42,7 +46,11 @@ def main():
         "negative_prompt": args.negative_prompt, "num_inference_steps": args.steps,
         "guidance_scale": args.guidance_scale, "width": args.width, "height": args.height,
     }
-    result = pipe(args.prompt, seed=args.seed, **{k: v for k, v in optional.items() if v is not None})
+    sampling_options = {}
+    for name, value in optional.items():
+        if value is not None:
+            sampling_options[name] = value
+    result = pipe(args.prompt, seed=args.seed, **sampling_options)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     result.images[0].save(args.output)
 
